@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>kehezen · clock</title>
+<style>
+:root {
+  --bg:     #080808;
+  --text:   #c0c0c0;
+  --muted:  #3a3a3a;
+  --accent: rgba(188, 148, 88, 0.85);
+  --border: rgba(255,255,255,0.07);
+}
+
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%; min-height: 100%;
+  background: var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow-y: auto;
+}
+
+.wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2rem;
+  padding: 2.5rem 1.5rem;
+}
+
+canvas { display: block; flex-shrink: 0; }
+
+/* ── controls ─────────────────────────────────────────────────────── */
+
+.controls {
+  width: 100%;
+  max-width: 380px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.status {
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: transparent;
+  text-align: center;
+  min-height: 1.5em;
+  transition: color 200ms ease-out;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.status.active   { color: var(--accent); }
+.status.arrived  { color: #6aaa6a; }
+
+.row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+}
+
+input[type="datetime-local"] {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  font-size: 13px;
+  padding: 0 0.25rem;
+  outline: none;
+  color-scheme: dark;
+  height: 44px;
+}
+input[type="datetime-local"]:focus-visible {
+  outline: 1px solid rgba(255,255,255,0.13);
+  border-radius: 2px;
+  outline-offset: 3px;
+}
+
+button {
+  height: 44px;
+  padding: 0 1.1rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+  border-radius: 2px;
+  transition: border-color 150ms ease-out, color 150ms ease-out;
+  white-space: nowrap;
+}
+button:hover          { border-color: rgba(255,255,255,0.18); color: var(--text); }
+button:focus-visible  { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+#go-btn { border-color: rgba(188,148,88,0.3); color: rgba(188,148,88,0.7); }
+#go-btn:hover { border-color: rgba(188,148,88,0.7); color: rgba(188,148,88,1); }
+
+#reset-btn { padding: 0 0.75rem; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+</style>
+</head>
+<body>
+<div class="wrapper">
+  <canvas id="c"></canvas>
+  <div class="controls">
+    <p class="status" id="status" aria-live="polite"></p>
+    <div class="row">
+      <input type="datetime-local" id="target-input" step="1" aria-label="Destination date and time">
+      <button id="go-btn">go</button>
+      <button id="reset-btn" title="Retour au présent" style="display:none">×</button>
+    </div>
+  </div>
+</div>
+<script>
+'use strict';
+
+// ── canvas setup ──────────────────────────────────────────────────────────────
+
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+
+const S  = Math.min(window.innerWidth, Math.floor(window.innerHeight * 0.58), 480);
+canvas.width = canvas.height = S;
+
+const CX = S / 2, CY = S / 2, R = S * 0.41;
+
+// Elder Futhark — 12 runes, 12h en tête, sens horaire
+const RUNES = ['𐑐','𐑑','𐑒','𐑓','𐑔','𐑕','𐑖','𐑗','𐑘','𐑙','𐑚','𐑛'];
+
+// ── machine à temps ───────────────────────────────────────────────────────────
+//
+//   live    → simTime = Date.now() en temps réel
+//   travel  → simTime avance / recule à ×100 vers targetTs
+//   arrived → simTime continue en temps réel depuis targetTs
+
+const SPEED = 100;
+
+let simTime     = Date.now();
+let lastPerf    = performance.now();
+let mode        = 'live';   // 'live' | 'travel' | 'arrived'
+let targetTs    = null;
+let travelDir   = 1;        // +1 avance, -1 recule
+let frameCount  = 0;
+
+// ── UI ────────────────────────────────────────────────────────────────────────
+
+const statusEl    = document.getElementById('status');
+const targetInput = document.getElementById('target-input');
+const goBtn       = document.getElementById('go-btn');
+const resetBtn    = document.getElementById('reset-btn');
+
+const pad = n => String(n).padStart(2, '0');
+
+function fmt(ts) {
+  const d = new Date(ts);
+  return `${pad(d.getDate())}/${pad(d.getMonth()+1)} `
+       + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function setStatus(text, cls = '') {
+  statusEl.textContent = text;
+  statusEl.className   = `status ${cls}`.trim();
+}
+
+function startTravel() {
+  const val = targetInput.value;
+  if (!val) return;
+  const ts = new Date(val).getTime();
+  if (isNaN(ts)) return;
+
+  targetTs    = ts;
+  travelDir   = ts >= simTime ? 1 : -1;
+  mode        = 'travel';
+  resetBtn.style.display = '';
+  setStatus((travelDir === 1 ? '→ ' : '← ') + fmt(simTime), 'active');
+}
+
+goBtn.addEventListener('click', startTravel);
+targetInput.addEventListener('keydown', e => { if (e.key === 'Enter') startTravel(); });
+
+resetBtn.addEventListener('click', () => {
+  mode       = 'live';
+  targetTs   = null;
+  simTime    = Date.now();
+  resetBtn.style.display = 'none';
+  targetInput.value = '';
+  setStatus('');
+});
+
+// ── géométrie ─────────────────────────────────────────────────────────────────
+
+function tip(frac, len) {
+  const a = frac * Math.PI * 2;
+  return [CX + Math.sin(a) * len, CY - Math.cos(a) * len];
+}
+
+// ── élastique ─────────────────────────────────────────────────────────────────
+//   longueur naturelle courte → tendu par défaut
+//   point de contrôle Bézier toujours tiré vers le bas (gravité pure)
+
+function drawElastic(ax, ay, bx, by) {
+  const dist    = Math.hypot(bx - ax, by - ay);
+  const natural = R * 0.38;
+  const slack   = Math.max(0, natural - dist);
+  const sag     = Math.min(R * 0.32, 5 + slack * 1.25);
+  const mx      = (ax + bx) / 2;
+  const my      = (ay + by) / 2;
+
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.92)';
+  ctx.lineWidth   = 1.7;
+  ctx.lineCap     = 'round';
+  ctx.beginPath();
+
+  if (dist < 4) {
+    // Aiguilles quasi-confondues : pend en larme
+    ctx.ellipse(ax, ay + sag * 0.65, 5, sag * 0.65, 0, 0, Math.PI * 2);
+  } else {
+    ctx.moveTo(ax, ay);
+    ctx.quadraticCurveTo(mx, my + sag, bx, by);
+  }
+
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ── aiguille ──────────────────────────────────────────────────────────────────
+
+function drawHand(frac, len, thick, color, tail = 0) {
+  const a  = frac * Math.PI * 2;
+  const sx = Math.sin(a), cy = -Math.cos(a);
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = thick;
+  ctx.lineCap     = 'round';
+  ctx.beginPath();
+  ctx.moveTo(CX - sx * tail, CY - cy * tail);
+  ctx.lineTo(CX + sx * len,  CY + cy * len);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ── cadran ────────────────────────────────────────────────────────────────────
+
+function drawFace() {
+  ctx.font         = `${Math.round(R * 0.118)}px 'Noto Sans Shavian', Georgia, serif`;
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * Math.PI * 2;
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.fillText(RUNES[i], CX + Math.sin(a) * R * 0.775, CY - Math.cos(a) * R * 0.775);
+  }
+}
+
+// ── boucle ────────────────────────────────────────────────────────────────────
+
+function frame(perfNow) {
+  // Cap à 200 ms : évite les sauts si l'onglet était en veille
+  const realDelta = Math.min(perfNow - lastPerf, 200);
+  lastPerf = perfNow;
+  frameCount++;
+
+  // ── avancement du temps simulé ───────────────────────────────────────────
+  if (mode === 'travel') {
+    const next    = simTime + realDelta * SPEED * travelDir;
+    const arrived = travelDir === 1 ? next >= targetTs : next <= targetTs;
+
+    simTime = arrived ? targetTs : next;
+
+    if (arrived) {
+      mode = 'arrived';
+      setStatus('↓ ' + fmt(targetTs), 'arrived');
+      setTimeout(() => { if (mode === 'arrived') setStatus(''); }, 2500);
+    } else if (frameCount % 18 === 0) {
+      // Affiche le temps simulé courant qui défile vers la cible
+      setStatus((travelDir === 1 ? '→ ' : '← ') + fmt(simTime), 'active');
+    }
+
+  } else if (mode === 'live') {
+    simTime = Date.now();
+  } else {
+    // arrived : continue en temps réel depuis le point d'arrivée
+    simTime += realDelta;
+  }
+
+  // ── fractions d'aiguilles ────────────────────────────────────────────────
+  const d  = new Date(simTime);
+  const ms = d.getMilliseconds();
+  const s  = d.getSeconds() + ms / 1000;
+  const m  = d.getMinutes() + s / 60;
+  const h  = (d.getHours() % 12) + m / 60;
+  const sf = s / 60, mf = m / 60, hf = h / 12;
+
+  // ── rendu ────────────────────────────────────────────────────────────────
+  ctx.clearRect(0, 0, S, S);
+  drawFace();
+
+  const [hx, hy] = tip(hf, R * 0.50);
+  const [mx, my] = tip(mf, R * 0.715);
+
+  drawElastic(hx, hy, mx, my);
+
+  drawHand(sf, R * 0.775, 1.7, 'rgba(255,255,255,0.92)');
+  drawHand(hf, R * 0.50,  1.7, 'rgba(255,255,255,0.92)');
+  drawHand(mf, R * 0.715, 1.7, 'rgba(255,255,255,0.92)');
+
+  ctx.beginPath();
+  ctx.arc(CX, CY, 3.5, 0, Math.PI * 2);
+  ctx.fillStyle = '#dedede';
+  ctx.fill();
+
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
